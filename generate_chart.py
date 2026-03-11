@@ -2,7 +2,8 @@ import pandas as pd
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
-
+import matplotlib
+matplotlib.use("Agg")
 load_dotenv()
 
 
