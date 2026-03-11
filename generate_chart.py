@@ -11,15 +11,6 @@ class ChartGenerator:
         self.data = data
         self.col_dt_list = [(col, dt) for col, dt in zip(data.columns, data.dtypes)]
 
-    @staticmethod
-    def read_data(file_path):
-        if file_path.endswith(".csv"):
-            return pd.read_csv(file_path)
-        elif file_path.endswith(".xlsx"):
-            return pd.read_excel(file_path)
-        else:
-            raise ValueError("Unsupported file format. Please provide a .csv or .xlsx file.")
-
     def generate_charts_code(self, col_dt_list, query):
         client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
@@ -32,54 +23,46 @@ class ChartGenerator:
                 {
                     "role": "system",
                     "content": """
-You are an Agentic AI Data Analyst and Visualization Engine.
+You are an AI data visualization generator.
 
-Your task is to analyze provided dataset column names and their data types
-and generate Python code for meaningful data visualization charts.
+Return ONLY Python code that generates charts.
 
-STRICT RULES:
-- Output ONLY executable Python code.
-- Do NOT include explanations, markdown formatting, or extra text.
-- Assume a pandas DataFrame named 'df' already exists.
-- Import: os, matplotlib.pyplot as plt, seaborn as sns.
-- Include: os.makedirs('charts', exist_ok=True)
-- Save every chart using:
-  plt.savefig(f'charts/{filename}.png')
-- Call plt.close() after saving each chart.
-- Do NOT use display(), show(), or print().
+Rules:
+- DataFrame name is df
+- Import matplotlib.pyplot as plt and seaborn as sns
+Save every chart using:
+plt.savefig(os.path.join(charts_dir, f"{filename}.png"))
 
-ANALYSIS RULES:
-- Detect numerical, categorical, and datetime columns automatically.
-- For numerical columns → histograms, boxplots, correlation heatmaps.
-- For categorical columns → bar charts.
-- For datetime columns → trend/time-series plots.
-- Avoid redundant or meaningless charts.
-
-OUTPUT FORMAT RULE:
-- The response must contain ONLY Python code.
-- Each chart must be separated using triple double quotes.
-
-Example format:
-
-### chart 1
-chart code
-plt.savefig(...)
-
-### chart 2
-chart code
-plt.savefig(...)
-
-### chart 3
-chart code
-plt.savefig(...)
-""",
+A variable named charts_dir already exists and represents the folder where charts must be saved.
+- Call plt.close() after each chart
+- Do not print or show charts
+"""
                 },
                 {
                     "role": "user",
-                    "content": f"Here are the column names and their data types: {col_dt_list}\n{query}",
-                },
-            ],
-            extra_body={"reasoning": {"enabled": True}},
+                    "content": f"Columns and types: {col_dt_list}\nQuery: {query}"
+                }
+            ]
         )
 
         return response.choices[0].message.content.strip()
+
+    def execute_generated_code(self, generated_code, charts_dir):
+
+        os.makedirs(charts_dir, exist_ok=True)
+
+        generated_code = generated_code.replace("```python", "").replace("```", "").strip()
+
+        safe_globals = {
+            "df": self.data,
+            "plt": __import__("matplotlib.pyplot"),
+            "sns": __import__("seaborn"),
+            "pd": __import__("pandas"),
+            "os": __import__("os"),
+            "charts_dir": charts_dir
+        }
+
+        try:
+            exec(generated_code, safe_globals)
+        except Exception as e:
+            raise RuntimeError(f"Chart execution failed: {str(e)}")
