@@ -1,6 +1,5 @@
 .env
 __pycache__/
-charts/
 *.pyc
 venv/
 .env
