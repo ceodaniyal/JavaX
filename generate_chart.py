@@ -103,7 +103,7 @@ Choose chart types based on the dataset structure and the user query.
 
 If the query asks for a specific visualization (example: "sales trend", "distribution of price"), generate ONE chart.
 
-If the query asks for:
+If the query asks for keywords like:
 - dashboard
 - analyse
 - overview
@@ -114,6 +114,16 @@ Then generate MULTIPLE important charts.
 
 For dashboard or analysis requests generate between 3 and 6 charts maximum.
 
+IMPORTANT:
+
+The system only generates charts, NOT UI dashboards.
+
+If the user asks to "create dashboard", "build dashboard", or "generate dashboard",
+interpret it strictly as a request for multiple charts (3-6 charts).
+
+Can also repeat type of charts if relevant, but only twice or thrice (example: multiple line charts for different categories).
+
+Never skip chart generation.
 ------------------------------------------------
 
 SUPPORTED CHART TYPES
@@ -281,6 +291,9 @@ Only return valid Python code.
         os.makedirs(charts_dir, exist_ok=True)
 
         generated_code = generated_code.replace("```python", "").replace("```", "").strip()
+
+        generated_code = generated_code.replace('resample("M")', 'resample("ME")')
+        generated_code = generated_code.replace("resample('M')", "resample('ME')")
 
         safe_globals = {
             "df": self.data,

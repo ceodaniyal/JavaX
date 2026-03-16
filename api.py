@@ -1,3 +1,6 @@
+
+from db import charts_collection
+from datetime import datetime, timezone
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
@@ -5,6 +8,7 @@ import io
 import os
 import base64
 import uuid
+
 
 from generate_chart import ChartGenerator
 
@@ -29,6 +33,7 @@ async def generate_code(
     file: UploadFile = File(...),
     query: str = Form(...)
 ):
+    print("REQUEST RECEIVED")
 
     try:
         contents = await file.read()
@@ -53,6 +58,7 @@ async def generate_code(
         chart_generator.execute_generated_code(generated_code, charts_dir)
 
         images = []
+        chart_paths = []
 
         for img_file in os.listdir(charts_dir):
             if img_file.endswith(".png"):
@@ -67,7 +73,21 @@ async def generate_code(
                     "image_base64": encoded
                 })
 
+                chart_paths.append({
+                    "filename": img_file,
+                    "path": path
+                })
+        # SAVE TO MONGODB HERE
+        charts_collection.insert_one({
+            "request_id": request_id,
+            "query": query,
+            "file_name": file.filename,
+            "charts": chart_paths,
+            "created_at": datetime.now(timezone.utc)
+        })
+
         return {
+            "request_id": request_id,
             "charts": images
         }
 
