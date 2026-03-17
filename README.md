@@ -1,4 +1,4 @@
-# 📊 Project Name
+# 📊 JAVAX
 
 A backend system that generates charts from dataset based on user prompts.
 
