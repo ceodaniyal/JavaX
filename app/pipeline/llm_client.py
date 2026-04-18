@@ -49,7 +49,7 @@ CHART RULES:
 5. Use "color" ONLY when: query compares across categories AND the
    column has <= 6 unique values AND chart type is line or bar.
 6. Max 20 categories per axis.
-7. For dashboard/overview queries return at least 2-3 DIVERSE charts
+7. For dashboard/overview queries return atleast 2-3 DIVERSE charts
    (e.g. one line + one bar, not two bars on the same column).
 
 TABLE RULES — READ CAREFULLY:

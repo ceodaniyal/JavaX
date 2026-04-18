@@ -1,13 +1,14 @@
 import asyncio
-import logging
-logger = logging.getLogger(__name__)
-import pandas as pd
 import concurrent.futures
+import logging
+import os
+import time
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # Single shared executor — sized for CPU work across concurrent requests.
-# Rule of thumb: (os.cpu_count() or 4) * 2 for mixed I/O+CPU work.
-# Adjust max_workers to your pod's vCPU count.
-import os
 EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=(os.cpu_count() or 4) * 2,
     thread_name_prefix="chart-worker",
@@ -21,43 +22,41 @@ from app.pipeline.table_builder import TableBuilder
 from app.pipeline.scorecard import ScorecardBuilder
 from app.schemas.chart_schema import LLMResponseSchema
 from app.utils.cache import _cache_key, _result_cache
+from app.utils.task_manager import is_cancelled
 
 
 def _set_loop_executor(loop: asyncio.AbstractEventLoop | None = None) -> None:
     """
-    Call once at startup (e.g. in your FastAPI lifespan) so that
-    asyncio.to_thread() uses the same sized pool as _build_charts.
+    Call once at startup so asyncio.to_thread() uses the shared pool.
 
         from app.pipeline.chart_service import EXECUTOR, _set_loop_executor
-        _set_loop_executor()          # or pass loop explicitly
+        _set_loop_executor()
     """
     (loop or asyncio.get_event_loop()).set_default_executor(EXECUTOR)
 
 
 class ChartGenerator:
     def __init__(self, data: pd.DataFrame):
-        self.data                = data
-        self._col_dt_list        = list(zip(data.columns, data.dtypes))
-        self._llm                = LLMClient()
-        self._normalizer         = ChartConfigNormalizer(data)
-        self._transformer        = DataTransformer(data)
-        self._builder            = ChartBuilder(self._transformer)
-        self._table_builder      = TableBuilder(data)
-        self._scorecard_builder  = ScorecardBuilder(data)  # deterministic, no LLM
+        self.data               = data
+        self._col_dt_list       = list(zip(data.columns, data.dtypes))
+        self._llm               = LLMClient()
+        self._normalizer        = ChartConfigNormalizer(data)
+        self._transformer       = DataTransformer(data)
+        self._builder           = ChartBuilder(self._transformer)
+        self._table_builder     = TableBuilder(data)
+        self._scorecard_builder = ScorecardBuilder(data)
         logger.info("ChartGenerator initialised (%d rows, %d cols)", *data.shape)
 
-    # Intent keywords that should ALWAYS produce tables even if LLM forgets
+    # ── Intent keyword sets ──────────────────────────────────────────────────
+
     _BROAD_INTENT = {
-        # explicit dashboard/analysis words
         "dashboard", "analyze", "analyse", "analysis", "analyses",
         "overview", "report", "explore", "exploration",
         "insights", "insight", "understand", "examine", "investigate",
         "full", "complete", "everything", "all", "whole", "entire",
-        # natural-language phrasings
         "show me", "tell me", "give me", "what is", "what are",
         "create dashboard", "make dashboard", "build dashboard",
         "deep dive", "deep-dive",
-        # single-word verbs people type
         "summarize", "summarise",
     }
     _SUMMARY_INTENT = {
@@ -78,11 +77,6 @@ class ChartGenerator:
         return any(kw in q for kw in keywords)
 
     def _augment_query(self, query: str) -> str:
-        """
-        For broad/dashboard queries inject a mandatory hint with concrete
-        column names. This fires BEFORE the LLM call so the model sees it.
-        We now push charts hard and cap tables at 2 (pivot-only, no scalars).
-        """
         if not self._needs_table(query):
             return query
 
@@ -120,33 +114,22 @@ class ChartGenerator:
         )
 
     def _default_tables(self, query: str) -> list:
-        """
-        Deterministic table builder — fires when LLM ignores table instructions.
-        Rules:
-          - MAX 2 tables
-          - Only grouped/pivot tables (never single-row scalar summaries — those are scorecards)
-          - If no categorical column exists, return [] rather than a scalar table
-        """
-        df      = self.data
-        tables  = []
+        df     = self.data
+        tables = []
 
         num_cols = df.select_dtypes(include="number").columns.tolist()
         if not num_cols:
             return []
 
-        # pick up to 2 categorical columns with useful cardinality (2–30 unique values)
         cat_cols = [
             c for c in df.select_dtypes(include=["object", "category"]).columns
             if 2 <= df[c].nunique() <= 30
         ]
 
         if not cat_cols:
-            # No categorical columns → grouped tables impossible → skip entirely
-            # (scalars are already covered by scorecards)
-            logger.info("_default_tables: no categorical columns — skipping (scorecards cover KPIs)")
+            logger.info("_default_tables: no categorical columns — skipping")
             return []
 
-        # Table 1: best num col grouped by best cat col
         cat1, num1 = cat_cols[0], num_cols[0]
         try:
             tbl = (
@@ -163,15 +146,13 @@ class ChartGenerator:
         except Exception as exc:
             logger.error("Default table 1 failed: %s", exc)
 
-        # Table 2: pivot cat1 × cat2 if a second cat col exists, else second num col by cat1
         if len(tables) < 2:
             if len(cat_cols) >= 2:
                 cat2 = cat_cols[1]
-                num_for_pivot = num_cols[0]
                 try:
                     pivot = (
                         pd.pivot_table(df, index=cat1, columns=cat2,
-                                       values=num_for_pivot, aggfunc="sum", observed=True)
+                                       values=num_cols[0], aggfunc="sum", observed=True)
                         .fillna(0).reset_index().head(20)
                     )
                     pivot.columns = [
@@ -179,7 +160,7 @@ class ChartGenerator:
                         for c in pivot.columns
                     ]
                     tables.append({
-                        "title": f"{num_for_pivot} by {cat1} and {cat2}",
+                        "title": f"{num_cols[0]} by {cat1} and {cat2}",
                         "data": pivot.to_dict(orient="records"),
                     })
                 except Exception as exc:
@@ -201,58 +182,90 @@ class ChartGenerator:
                 except Exception as exc:
                     logger.error("Default table 2 failed: %s", exc)
 
-        logger.info("Built %d deterministic default table(s) for query: %r", len(tables), query[:60])
+        logger.info("Built %d default table(s) for query: %r", len(tables), query[:60])
         return tables
 
     def _filter_table_configs(self, table_cfgs: list) -> list:
-        """
-        Remove table configs that would produce single-row scalar summaries.
-        These duplicate scorecard data and add no value.
-
-        A summary table is scalar if it has no 'index' column — meaning it
-        aggregates the whole column into one number. Pivot tables always have
-        an index, so they always pass through.
-        """
         filtered = []
         for cfg in table_cfgs:
             if isinstance(cfg, dict):
-                # Already-rendered dict from _default_tables — always grouped, keep it
                 filtered.append(cfg)
             elif cfg.type == "summary":
-                # summary tables with no index = single scalar row = scorecard duplicate
-                logger.info(
-                    "Dropping scalar summary table %r — already covered by scorecards", cfg.title
-                )
-                # Drop it
+                logger.info("Dropping scalar summary table %r — covered by scorecards", cfg.title)
             else:
-                # pivot or any other type — keep
                 filtered.append(cfg)
         return filtered
 
-    async def generate(self, query: str) -> dict:
-        # cache check
+    # ── Cooperative cancellation ─────────────────────────────────────────────
+
+    @staticmethod
+    def _check_cancelled(task_id: str, stage: str) -> None:
+        """
+        Raise CancelledError if the cancel flag has been set for this task.
+        Call this at every async stage boundary — it's instant and has no I/O.
+
+        The LLM HTTP request itself cannot be interrupted mid-flight, so the
+        first safe kill points are:
+          • before we start any work          (catches instant cancels)
+          • after _prepare_llm_input          (before LLM is even called)
+          • after the LLM call returns        (discard result if flagged)
+          • after _process_sync               (before writing 'completed')
+        """
+        if is_cancelled(task_id):
+            logger.info("Cancel flag detected at stage '%s' for task %s", stage, task_id)
+            raise asyncio.CancelledError(f"Cancelled at stage: {stage}")
+
+    # ── Main entry point ─────────────────────────────────────────────────────
+
+    async def generate(self, query: str, task_id: str = "") -> dict:
+        # ── Cache check ──────────────────────────────────────────────────────
         key = _cache_key(self.data, query)
         if (cached := _result_cache.get(key)) is not None:
             logger.info("Cache hit for query: %r", query[:60])
             return cached
 
-        # augment broad queries with mandatory table hint before LLM call
-        effective_query = self._augment_query(query)
+        # Stage 0: catch immediate cancels before any work starts
+        self._check_cancelled(task_id, "pre-start")
 
-        # FIX: run _prepare_llm_input on the shared EXECUTOR so it doesn't
-        # consume a slot from the default loop executor
+        effective_query = self._augment_query(query)
         loop = asyncio.get_running_loop()
+
+        # ── Stage 1: prepare LLM input (CPU — offloaded to thread) ──────────
         sample, stats = await loop.run_in_executor(EXECUTOR, self._prepare_llm_input)
 
-        llm_schema = await self._llm.get_chart_config(self._col_dt_list, sample, stats, effective_query)
+        # Stage boundary: cancel before paying LLM API costs
+        self._check_cancelled(task_id, "pre-llm")
 
-        # FIX: run CPU processing on the same shared EXECUTOR
+        # ── Stage 2: LLM call ────────────────────────────────────────────────
+        # wait_for enforces a hard timeout. The underlying HTTP request cannot
+        # be killed once sent, but wait_for lets CancelledError propagate here
+        # instead of inside the LLM library.
+        try:
+            llm_schema = await asyncio.wait_for(
+                self._llm.get_chart_config(
+                    self._col_dt_list, sample, stats, effective_query
+                ),
+                timeout=180,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("LLM call timed out for query: %r", query[:60])
+            raise Exception("LLM timed out — please try again")
+
+        # Stage boundary: LLM is done; check flag before paying CPU costs.
+        # This is the most important check — it's where "stop was pressed
+        # during LLM call" gets caught cleanly.
+        self._check_cancelled(task_id, "post-llm")
+
+        # ── Stage 3: CPU processing (offloaded to thread) ────────────────────
         result = await loop.run_in_executor(
             EXECUTOR,
             self._process_sync,
             llm_schema,
             query,
         )
+
+        # Stage boundary: CPU done; last check before caching + returning.
+        self._check_cancelled(task_id, "post-processing")
 
         _result_cache.set(key, result)
         return result
@@ -262,18 +275,25 @@ class ChartGenerator:
         stats  = self.data.describe(include="all").to_string()
         return sample, stats
 
-    def _process_sync(self, llm_schema, query):
-        logger.info("START processing")
-        import time
-        time.sleep(3)
+    def _process_sync(self, llm_schema: LLMResponseSchema, query: str) -> dict:
+        """
+        CPU-bound processing step.  Runs inside a ThreadPoolExecutor thread.
 
-        # scorecards
+        Cancellation note
+        -----------------
+        asyncio.CancelledError cannot propagate into a thread — it will only
+        arrive back in the event loop after run_in_executor() returns.  We
+        therefore add a lightweight cooperative check via a threading.Event
+        if you need finer-grained interruption in the future; for now, the
+        yield points in `generate()` cover all stage boundaries.
+        """
+        logger.info("_process_sync START")
+        t0 = time.perf_counter()
+
         scorecards = self._scorecard_builder.build()
 
-        # charts
         charts = self._build_charts(llm_schema)
 
-        # tables
         table_cfgs = llm_schema.tables
         table_cfgs = self._filter_table_configs(table_cfgs)
         table_cfgs = table_cfgs[:2]
@@ -285,31 +305,22 @@ class ChartGenerator:
         tables = self._table_builder.build_all(table_cfgs)
 
         result = {"scorecards": scorecards, "charts": charts, "tables": tables}
-
         logger.info(
-            f"Charts generated: {len(result['charts'])}  |  Tables: {len(result['tables'])}"
+            "_process_sync END  charts=%d  tables=%d  elapsed=%.2fs",
+            len(charts), len(tables), time.perf_counter() - t0,
         )
-        logger.info("END processing")
-
         return result
 
     def _build_charts(self, llm_schema: LLMResponseSchema) -> list:
-        """
-        FIX: reuse the module-level EXECUTOR instead of spawning a new
-        ThreadPoolExecutor() on every call. Creating a fresh pool per request
-        was the second source of thread starvation.
-        """
         def process_one(chart_schema):
             cfg = self._normalizer.normalize(chart_schema)
             if cfg is None:
                 return None
             return self._builder.build(cfg)
 
-        # submit all chart jobs to the shared pool; futures resolve in parallel
         futures = [EXECUTOR.submit(process_one, cs) for cs in llm_schema.charts]
         results = [f.result() for f in concurrent.futures.as_completed(futures)]
-
-        charts = [r for r in results if r is not None]
+        charts  = [r for r in results if r is not None]
         return charts or self._fallback_chart()
 
     def _fallback_chart(self) -> list:
@@ -322,6 +333,9 @@ class ChartGenerator:
             values = values.sample(1000, random_state=0)
         logger.info("Using fallback histogram for column %r", col)
         return [{
-            "type": "histogram", "title": f"Distribution of {col}",
-            "values": values.tolist(), "x_label": col, "layout_size": "medium",
+            "type": "histogram",
+            "title": f"Distribution of {col}",
+            "values": values.tolist(),
+            "x_label": col,
+            "layout_size": "medium",
         }]
