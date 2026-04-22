@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import uuid
+from pydantic import BaseModel
 
 import pandas as pd
 from fastapi import APIRouter, UploadFile, File, Form
@@ -12,6 +13,9 @@ from plotly.utils import PlotlyJSONEncoder
 
 from app.services.chart_service import ChartGenerator
 from app.utils.task_manager import create_task, cancel_task, remove_task, is_cancelled
+from app.services.chat_service import ChatService
+from app.utils.data_store import data_store
+
 
 router = APIRouter()
 
@@ -34,25 +38,13 @@ _results: dict[str, dict] = {}
 def health_check():
     return {"status": "successful"}
 
-
-# ─────────────────────────────────────────────
-# START ANALYSIS  (replaces the old /generate-code)
-# ─────────────────────────────────────────────
-@router.post("/start-analysis")
-async def start_analysis(
-    file: UploadFile = File(...),
-    query: str = Form(...),
-):
+@router.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
     """
-    Accepts a file + query, kicks off a background task, and immediately
-    returns a task_id.  The client polls /status/{task_id} to track progress
-    and may call /cancel/{task_id} at any time.
+    Upload dataset ONLY (no processing)
+    Returns dataset_id
     """
-    task_id = str(uuid.uuid4())
-    logger.info("Starting analysis task %s for query: %r", task_id, query[:60])
 
-    # Read the file eagerly — the UploadFile object is not safe to pass into
-    # a background task because the request lifecycle may close it first.
     contents = await file.read()
     filename = file.filename or ""
 
@@ -63,7 +55,61 @@ async def start_analysis(
     else:
         return JSONResponse(
             status_code=400,
-            content={"error": "Unsupported file format. Upload a .csv or .xlsx file."},
+            content={"error": "Unsupported file format"},
+        )
+
+    dataset_id = data_store.save(df)
+
+    logger.info("Dataset uploaded: %s", dataset_id)
+
+    return {"dataset_id": dataset_id}
+
+# ─────────────────────────────────────────────
+# START ANALYSIS  (replaces the old /generate-code)
+# ─────────────────────────────────────────────
+@router.post("/start-analysis")
+async def start_analysis(
+    dataset_id: str = Form(...),
+    query: str = Form(...),
+):
+    """
+    Accepts dataset_id + query kicks off a background task, and immediately
+    returns a task_id.  The client polls /status/{task_id} to track progress
+    and may call /cancel/{task_id} at any time.
+    """
+    task_id = str(uuid.uuid4())
+    logger.info("Starting analysis task %s for query: %r", task_id, query[:60])
+
+    # # Read the file eagerly — the UploadFile object is not safe to pass into
+    # # a background task because the request lifecycle may close it first.
+    # contents = await file.read()
+    # filename = file.filename or ""
+
+    # if filename.endswith(".csv"):
+    #     df = pd.read_csv(io.BytesIO(contents))
+    # elif filename.endswith(".xlsx"):
+    #     df = pd.read_excel(io.BytesIO(contents))
+    # else:
+    #     return JSONResponse(
+    #         status_code=400,
+    #         content={"error": "Unsupported file format. Upload a .csv or .xlsx file."},
+    #     )
+    
+    # dataset_id = data_store.save(df)
+
+    df = data_store.get(dataset_id)
+
+    if df is None:
+        logger.warning("Invalid dataset_id: %s", dataset_id)
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid or expired dataset_id"},
+        )
+
+    if df is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid dataset_id"},
         )
 
     # Mark as running immediately so the frontend sees a valid status on its
@@ -101,7 +147,7 @@ async def start_analysis(
 
     create_task(task_id, _run())
 
-    return {"task_id": task_id}
+    return {"task_id": task_id }
 
 
 # ─────────────────────────────────────────────
@@ -140,3 +186,23 @@ async def cancel(task_id: str):
 
     cancelled = cancel_task(task_id)
     return {"cancelled": cancelled}
+
+# ─────────────────────────────────────────────
+# Chat
+# ─────────────────────────────────────────────
+class ChatRequest(BaseModel):
+    dataset_id: str
+    query: str
+    history: list[dict] = []   # [{role: "user"|"assistant", content: str|dict}]
+
+@router.post("/chat")
+async def chat(req: ChatRequest):
+    df = data_store.get(req.dataset_id)
+
+    if df is None:
+        return JSONResponse(status_code=400, content={"error": "Invalid dataset_id"})
+
+    service = ChatService(df)
+    result = await service.chat(req.query, history=req.history)
+
+    return result

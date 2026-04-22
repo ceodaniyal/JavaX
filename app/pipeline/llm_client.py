@@ -205,7 +205,7 @@ class LLMClient:
     # ── private ──────────────────────────────────────────────────────
     async def _call(self, messages: list) -> str:
         response = await self._client.chat.completions.create(
-            model="nvidia/nemotron-3-super-120b-a12b:free",
+            model="openai/gpt-oss-120b:free",
             messages=messages,
         )
         return response.choices[0].message.content
