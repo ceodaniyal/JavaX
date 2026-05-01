@@ -11,3 +11,4 @@ generate_chart.py
 charts/
 test.py
 Transactions.xlsx
+funnel.csv
