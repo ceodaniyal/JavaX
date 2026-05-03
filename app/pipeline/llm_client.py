@@ -57,7 +57,7 @@ Example: "create 2 histograms" → return 2 histogram objects, each on a differe
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 QUERY MODE DETECTION  (governs chart count)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Classify the user query into one of three modes before generating output:
+Classify the user query into one of four modes before generating output:
 
   SPECIFIC  — user names exactly one chart type with no quantity ("show me a bar chart of sales by region")
               → Return exactly that chart. Nothing else.
@@ -66,10 +66,18 @@ Classify the user query into one of three modes before generating output:
               ("histogram and pie chart", "create 2 histograms")
               → Return all requested types / quantities. Nothing else.
 
+  ALL_OF_TYPE — query contains an [ALL INSTRUCTION] block, or uses "all", "every", or
+              "all possible" before a chart type ("all possible bar charts", "every histogram")
+              → Return EVERY distinct, meaningful chart of the requested type(s) that the
+                data supports. Each chart must use a DIFFERENT column or column combination.
+                Skip charts that would be meaningless or redundant.
+                Do NOT include scorecards, tables, or other chart types.
+
   EXPLORATORY — query is open-ended ("dashboard", "analyze", "overview", "insights")
               → Return as many diverse, meaningful charts as the data supports.
 
 Do NOT mix modes. If the query is SPECIFIC, do not add bonus charts.
+If the query is ALL_OF_TYPE, return ONLY the requested chart type — no scorecards, no tables.
 If the query is EXPLORATORY, do not artificially limit output.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -245,6 +253,7 @@ QUALITY CHECKLIST (apply before finalising output)
 ✓ Titles are descriptive (e.g. "Monthly Revenue Trend" not "Line Chart 1")
 ✓ Exploratory queries have diverse chart types — not all bars, not all pies
 ✓ Specific queries return exactly what was asked — no extras
+✓ ALL_OF_TYPE queries return ONLY the requested chart type — no scorecards, no tables, no other types
 ✓ Pie charts only used when ≤ 8 unique category values
 ✓ No summary tables with a single row
 ✓ histogram y is always null
@@ -403,7 +412,59 @@ class LLMClient:
             )
             return query  # fail-safe: always fall back to original
 
-    # ── existing: chart config ────────────────────────────────────────────────
+    async def is_data_query(self, query: str, col_dt_list: list) -> tuple[bool, str]:
+        """
+        Uses a lightweight LLM call to decide whether the query is relevant
+        to data analysis (charts, tables, scorecards, dashboards).
+
+        Returns:
+            (True,  "")           — query is relevant, proceed normally
+            (False, "<reason>")   — query is off-topic, reason is shown to user
+
+        Fail-safe: returns (True, "") on any error so a network hiccup never
+        blocks a legitimate query.
+        """
+        columns = [col for col, _ in col_dt_list]
+        prompt = f"""You are a classifier for a data analytics dashboard tool.
+The tool can ONLY do: charts, tables, scorecards, dashboards, and data analysis queries.
+The tool CANNOT do: generate images, write code, translate text, answer general knowledge questions,
+create artwork, write stories/poems, search the web, or anything unrelated to data analysis.
+
+Dataset columns available: {columns}
+
+User query: "{query}"
+
+Decide if this query is relevant to data analysis for the given dataset.
+
+Reply with ONLY valid JSON in this exact format:
+{{"relevant": true}} or {{"relevant": false, "reason": "one sentence explanation for the user"}}
+
+Examples:
+- "show bar chart of sales" → {{"relevant": true}}
+- "create image of batman" → {{"relevant": false, "reason": "I can only help with data analysis — I cannot generate images."}}
+- "give 3 tables" → {{"relevant": true}}
+- "translate this to french" → {{"relevant": false, "reason": "I can only help with data analysis — I cannot translate text."}}
+- "write a poem" → {{"relevant": false, "reason": "I can only help with data analysis — I cannot write creative content."}}
+- "dashboard" → {{"relevant": true}}
+"""
+        try:
+            raw = await self._call([
+                {"role": "system", "content": "You are a strict classifier. Reply ONLY with valid JSON. No explanation outside JSON."},
+                {"role": "user",   "content": prompt},
+            ])
+            clean = re.sub(r"```(?:json)?|```", "", raw).strip()
+            data  = json.loads(clean)
+            if data.get("relevant", True):
+                return True, ""
+            reason = data.get("reason") or (
+                "I can only help with data analysis — charts, tables, scorecards, and dashboards. "
+                "Please ask something about your dataset."
+            )
+            logger.info("Query rejected as off-topic: %r → %s", query[:80], reason)
+            return False, reason
+        except Exception as exc:
+            logger.warning("is_data_query failed (%s) — allowing query through", exc)
+            return True, ""  # fail-safe
     async def get_chart_config(
         self, col_dt_list: list, sample: str, stats: str, query: str
     ) -> LLMResponseSchema:
@@ -447,8 +508,67 @@ class LLMClient:
         logger.error("All LLM attempts failed — using deterministic fallback config")
         return self._fallback_config(col_dt_list)
 
+    async def get_scorecard_config(
+        self, col_dt_list: list, sample: str, stats: str, query: str,
+        max_scorecards: int = 8,
+    ) -> list:
+        """
+        Dedicated scorecard-config call: used by scorecards_only mode so we
+        never touch get_chart_config (which requires charts to be non-empty).
+        Returns a list of raw scorecard-config dicts. Returns [] on any failure.
+        """
+        columns = [col for col, _ in col_dt_list]
+        prompt = f"""You are a data analyst. Given the dataset below, design {max_scorecards} KPI scorecards.
+
+Dataset columns: {columns}
+
+Sample (first 5 rows):
+{sample}
+
+Stats:
+{stats}
+
+User query: {query}
+
+Rules:
+- Return exactly {max_scorecards} scorecards covering different business dimensions.
+- Each scorecard shows ONE aggregated number from a real business metric column.
+- NEVER use identifier columns (Row ID, Order ID, Customer ID, Zip, Phone).
+- Use sum for revenue/quantity/profit, mean for rates/percentages/ratings, count for entities.
+- Labels must be plain business English (e.g. "Total Revenue", "Avg Discount %").
+- Return ONLY valid JSON — no markdown, no explanation.
+
+Return this exact structure:
+{{
+  "scorecards": [
+    {{
+      "column": "column_name",
+      "aggregation": "sum | mean | count | min | max",
+      "label": "Human-readable label"
+    }}
+  ]
+}}
+
+If no meaningful scorecards can be built, return: {{"scorecards": []}}
+"""
+        try:
+            import json, re as _re
+            raw = await self._call([
+                {"role": "system", "content": "Return ONLY valid JSON. No markdown. No explanation."},
+                {"role": "user",   "content": prompt},
+            ])
+            clean = _re.sub(r"```(?:json)?|```", "", raw).strip()
+            data  = json.loads(clean)
+            scorecards = data.get("scorecards", [])
+            logger.info("get_scorecard_config returned %d scorecard(s)", len(scorecards))
+            return scorecards
+        except Exception as exc:
+            logger.warning("get_scorecard_config failed (%s) — returning empty", exc)
+            return []
+
     async def get_table_config(
-        self, col_dt_list: list, sample: str, stats: str, query: str
+        self, col_dt_list: list, sample: str, stats: str, query: str,
+        max_tables: int = 2,
     ) -> list:
         """
         Dedicated table-config call: used when the main LLM response contained
@@ -461,7 +581,7 @@ class LLMClient:
         stats, so it can decide which columns are meaningful for THIS dataset.
         """
         columns = [col for col, _ in col_dt_list]
-        prompt = f"""You are a data analyst. Given the dataset below, design 1–2 useful summary tables.
+        prompt = f"""You are a data analyst. Given the dataset below, design 1–{max_tables} useful summary tables.
 
 Dataset columns: {columns}
 
@@ -480,7 +600,7 @@ Rules:
 - NEVER use phone numbers, fax, SSN, or any code column as a metric.
 - Look at the sample rows to judge what each column actually contains.
 - A good table groups by a meaningful categorical column and aggregates real numeric metrics.
-- Return AT MOST 2 tables.
+- Return AT MOST {max_tables} tables.
 - Return ONLY valid JSON — no markdown, no explanation.
 
 Return this exact structure:
