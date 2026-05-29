@@ -4,4 +4,11 @@ __pycache__/
 venv/
 .env
 .DS_Store
-
+app/README.md
+db.py
+api.py
+generate_chart.py
+charts/
+test.py
+Transactions.xlsx
+funnel.csv
